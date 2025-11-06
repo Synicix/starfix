@@ -3,5 +3,5 @@
 extern crate uniffi as uniffi_external;
 uniffi_external::setup_scaffolding!();
 
+pub mod hasher;
 mod pyarrow;
-mod hasher;

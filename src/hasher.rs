@@ -10,14 +10,14 @@ use postcard::to_vec;
 
 const NULL_BYTES: &[u8] = b"NULL";
 
-struct ArrowDigester<D: Digest> {
+pub struct ArrowDigester<D: Digest> {
     schema: Schema,
     schema_digest: Vec<u8>,
     fields_digest_buffer: BTreeMap<String, D>,
 }
 
 impl<D: Digest> ArrowDigester<D> {
-    fn new(schema: Schema) -> Self {
+    pub fn new(schema: Schema) -> Self {
         // Hash the schema first
         let schema_digest = Self::hash_schema(&schema);
 
