@@ -1,0 +1,378 @@
+use std::collections::BTreeMap;
+
+use arrow::{
+    array::{Array, BooleanArray, RecordBatch, StructArray},
+    datatypes::{DataType, Schema},
+};
+use arrow_schema::Field;
+use digest::Digest;
+use postcard::to_vec;
+
+const NULL_BYTES: &[u8] = b"NULL";
+
+struct ArrowDigester<D: Digest> {
+    schema: Schema,
+    schema_digest: Vec<u8>,
+    fields_digest_buffer: BTreeMap<String, D>,
+}
+
+impl<D: Digest> ArrowDigester<D> {
+    fn new(schema: Schema) -> Self {
+        // Hash the schema first
+        let schema_digest = Self::hash_schema(&schema);
+
+        // Flatten all nested fields into a single map, this allows us to hash each field individually and efficiently
+        let mut fields_digest_buffer = BTreeMap::new();
+        schema.fields.into_iter().for_each(|field| {
+            Self::extract_fields_name(field, "", &mut fields_digest_buffer);
+        });
+
+        // Store it in the new struct for now
+        ArrowDigester {
+            schema,
+            schema_digest,
+            fields_digest_buffer,
+        }
+    }
+
+    /// Hash a array directly without needing to create an ArrowDigester instance on the user side
+    pub fn hash_array(array: &dyn Array) -> Vec<u8> {
+        let mut digest = D::new();
+        Self::array_digest_update(array.data_type(), array, &mut digest);
+        digest.finalize().to_vec()
+    }
+
+    /// Hash record batch directly without needing to create an ArrowDigester instance on the user side
+    pub fn hash_record_batch(record_batch: &RecordBatch) -> Vec<u8> {
+        let mut digester = ArrowDigester::<D>::new(record_batch.schema().as_ref().clone());
+        digester.update(record_batch.clone());
+        digester.finalize()
+    }
+
+    /// Internal recursive function to extract field names from nested structs effectively flattening the schema
+    /// The format is parent_child_grandchild_etc... for nested fields and will be stored in fields_digest_buffer
+    fn extract_fields_name(
+        field: &Field,
+        parent_field_name: &str,
+        fields_digest_buffer: &mut BTreeMap<String, D>,
+    ) {
+        // Check if field is a nested type of struct
+        match field.data_type() {
+            DataType::Struct(fields) => {
+                // We will add fields in alphabetical order
+                fields.into_iter().for_each(|field| {
+                    Self::extract_fields_name(field, parent_field_name, fields_digest_buffer);
+                });
+            }
+            _ => {
+                // Base case, just add the field name
+                let field_name = if parent_field_name.is_empty() {
+                    field.name().to_string()
+                } else {
+                    format!("{}_{}", parent_field_name, field.name())
+                };
+
+                fields_digest_buffer.insert(field_name, D::new());
+            }
+        }
+    }
+
+    fn hash_fixed_size_array(array: &dyn Array, digest: &mut D, element_size: i32) {
+        let array_data = array.to_data();
+
+        // Get the slice with offset accounted for if there is any
+        let slice = array_data.buffers()[0]
+            .as_slice()
+            .get(array_data.offset() * element_size as usize..)
+            .expect("Failed to get buffer slice for FixedSizeBinaryArray");
+
+        // Deal with null
+        match array_data.nulls() {
+            Some(null_buffer) => {
+                // There are nulls, so we need to incrementally hash each value
+                for i in 0..array_data.len() {
+                    if null_buffer.is_valid(i) {
+                        let data_pos = i * element_size as usize;
+                        digest.update(&slice[data_pos..data_pos + element_size as usize]);
+                    } else {
+                        digest.update(NULL_BYTES);
+                    }
+                }
+            }
+            None => {
+                // No nulls, we can hash the entire buffer directly
+                digest.update(slice);
+            }
+        }
+    }
+
+    /// Serialize the schema into a BTreeMap for field name and its digest
+    fn hash_schema(schema: &Schema) -> Vec<u8> {
+        let fields_digest = schema
+            .fields
+            .into_iter()
+            .map(|field| (field.name(), to_vec::<_, 256>(field).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+
+        // Hash the entire thing to the digest
+        D::digest(to_vec::<_, 1024>(&fields_digest).unwrap()).to_vec()
+    }
+
+    /// Hash a record batch and update the internal digests
+    fn update(&mut self, record_batch: RecordBatch) {
+        // Verify schema matches
+        if *record_batch.schema() != self.schema {
+            panic!("Record batch schema does not match ArrowDigester schema");
+        }
+
+        // Iterate through each field and update its digest
+        self.fields_digest_buffer
+            .iter_mut()
+            .for_each(|(field_name, digest)| {
+                // Determine if field name is nested
+                let field_name_hierarchy = field_name.split('_').collect::<Vec<_>>();
+
+                if field_name_hierarchy.len() == 1 {
+                    Self::array_digest_update(
+                        record_batch
+                            .schema()
+                            .field_with_name(field_name)
+                            .unwrap()
+                            .data_type(),
+                        record_batch.column_by_name(field_name).unwrap(),
+                        digest,
+                    );
+                } else {
+                    Self::update_nested_field(
+                        &field_name_hierarchy,
+                        0,
+                        record_batch
+                            .column_by_name(field_name_hierarchy[0])
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<StructArray>()
+                            .expect("Failed to downcast to StructArray"),
+                        digest,
+                    );
+                }
+            });
+    }
+
+    /// Recursive function to update nested field digests (structs within structs)
+    fn update_nested_field(
+        field_name_hierarchy: &Vec<&str>,
+        current_level: usize,
+        array: &StructArray,
+        digest: &mut D,
+    ) {
+        if field_name_hierarchy.len() == current_level {
+            // Base case, it should be a non-struct field
+            Self::array_digest_update(
+                array
+                    .column_by_name(field_name_hierarchy[0])
+                    .unwrap()
+                    .data_type(),
+                array
+                    .column_by_name(field_name_hierarchy[0])
+                    .unwrap()
+                    .as_ref(),
+                digest,
+            );
+        } else {
+            // Recursive case, it should be a struct field
+            let next_array = array
+                .column_by_name(field_name_hierarchy[current_level])
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("Failed to downcast to StructArray");
+
+            Self::update_nested_field(field_name_hierarchy, current_level + 1, next_array, digest);
+        }
+    }
+
+    /// This will consume the ArrowDigester and produce the final combined digest where the schema
+    /// digest is fed in first, followed by each field digest in alphabetical order of field names
+    pub fn finalize(self) -> Vec<u8> {
+        // Finalize all the sub digest and combine them into a single digest
+        let mut final_digest = D::new();
+
+        // digest the schema first
+        final_digest.update(&self.schema_digest);
+
+        // Then digest each field digest in order
+        self.fields_digest_buffer
+            .into_iter()
+            .for_each(|(_, digest)| {
+                let field_hash = digest.finalize();
+                final_digest.update(&field_hash);
+            });
+
+        final_digest.finalize().to_vec()
+    }
+
+    fn array_digest_update(data_type: &DataType, array: &dyn Array, digest: &mut D) {
+        match data_type {
+            DataType::Null => todo!(),
+            DataType::Boolean => {
+                // Bool Array is stored a bit differently, so we can't use the standard fixed buffer approach
+                let bool_array = array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("Failed to downcast to BooleanArray");
+
+                bool_array.into_iter().for_each(|value| match value {
+                    Some(b) => digest.update([b as u8]),
+                    None => digest.update(NULL_BYTES),
+                });
+            }
+            DataType::Int8 => Self::hash_fixed_size_array(array, digest, 1),
+            DataType::Int16 => Self::hash_fixed_size_array(array, digest, 2),
+            DataType::Int32 => Self::hash_fixed_size_array(array, digest, 4),
+            DataType::Int64 => Self::hash_fixed_size_array(array, digest, 8),
+            DataType::UInt8 => Self::hash_fixed_size_array(array, digest, 1),
+            DataType::UInt16 => Self::hash_fixed_size_array(array, digest, 2),
+            DataType::UInt32 => Self::hash_fixed_size_array(array, digest, 4),
+            DataType::UInt64 => Self::hash_fixed_size_array(array, digest, 8),
+            DataType::Float16 => Self::hash_fixed_size_array(array, digest, 2),
+            DataType::Float32 => Self::hash_fixed_size_array(array, digest, 4),
+            DataType::Float64 => Self::hash_fixed_size_array(array, digest, 8),
+            DataType::Timestamp(_, _) => todo!(),
+            DataType::Date32 => Self::hash_fixed_size_array(array, digest, 4),
+            DataType::Date64 => Self::hash_fixed_size_array(array, digest, 8),
+            DataType::Time32(_) => todo!(),
+            DataType::Time64(_) => todo!(),
+            DataType::Duration(_) => todo!(),
+            DataType::Interval(_) => todo!(),
+            DataType::Binary => todo!(),
+            DataType::FixedSizeBinary(_) => todo!(),
+            DataType::LargeBinary => todo!(),
+            DataType::BinaryView => todo!(),
+            DataType::Utf8 => todo!(),
+            DataType::LargeUtf8 => todo!(),
+            DataType::Utf8View => todo!(),
+            DataType::List(_) => todo!(),
+            DataType::ListView(_) => todo!(),
+            DataType::FixedSizeList(_, _) => todo!(),
+            DataType::LargeList(_) => todo!(),
+            DataType::LargeListView(_) => todo!(),
+            DataType::Struct(_) => todo!(),
+            DataType::Union(_, _) => todo!(),
+            DataType::Dictionary(_, _) => todo!(),
+            DataType::Decimal32(_, _) => todo!(),
+            DataType::Decimal64(_, _) => todo!(),
+            DataType::Decimal128(_, _) => todo!(),
+            DataType::Decimal256(_, _) => todo!(),
+            DataType::Map(_, _) => todo!(),
+            DataType::RunEndEncoded(_, _) => todo!(),
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, BooleanArray, Int32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use pretty_assertions::assert_eq;
+    use sha2::Sha256;
+
+    use crate::hasher::ArrowDigester;
+
+    #[test]
+    fn boolean_array_hashing() {
+        let bool_array = BooleanArray::from(vec![Some(true), None, Some(false), Some(true)]);
+        let hash = hex::encode(ArrowDigester::<Sha256>::hash_array(&bool_array));
+        println!("{}", hash);
+        assert_eq!(
+            hash,
+            "d7b7a73916d3f0c693ebcfa94fe2eee163d31a38ba8fe44ef81c5ffbff50c9be"
+        );
+    }
+
+    /// Test int32 array hashing which is really meant to test fixed size element array hashing
+    #[test]
+    fn int32_array_hashing() {
+        let int_array = arrow::array::Int32Array::from(vec![Some(42), None, Some(-7), Some(0)]);
+        let hash = hex::encode(ArrowDigester::<Sha256>::hash_array(&int_array));
+        println!("{}", hash);
+        assert_eq!(
+            hash,
+            "bb36e54f5e2d937a05bb716a8d595f1c8da67fda48feeb7ab5b071a69e63d648"
+        );
+    }
+
+    #[test]
+    fn commutative_tables() {
+        let uids = Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)])) as ArrayRef;
+        let fake_data = Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+        ])) as ArrayRef;
+
+        // Create two record batches with same data but different order
+        let batch1 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("uids", DataType::Int32, false),
+                Field::new("flags", DataType::Boolean, true),
+            ])),
+            vec![uids.clone(), fake_data.clone()],
+        );
+
+        let batch2 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("flags", DataType::Boolean, true),
+                Field::new("uids", DataType::Int32, false),
+            ])),
+            vec![fake_data.clone(), uids.clone()],
+        );
+
+        // Hash both record batches
+        assert_eq!(
+            ArrowDigester::<Sha256>::hash_record_batch(batch1.as_ref().unwrap()),
+            ArrowDigester::<Sha256>::hash_record_batch(batch2.as_ref().unwrap())
+        );
+    }
+
+    #[test]
+    fn record_batch_hashing() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("uids", DataType::Int32, false),
+            Field::new("flags", DataType::Boolean, true),
+        ]));
+
+        // Create two record batches with different data to simulate loading at different times
+        let uids = Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)])) as ArrayRef;
+        let fake_data = Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+        ]));
+
+        let batch1 = RecordBatch::try_new(schema.clone(), vec![uids, fake_data]).unwrap();
+
+        let uids2 =
+            Arc::new(Int32Array::from(vec![Some(5), Some(6), Some(7), Some(8)])) as ArrayRef;
+        let fake_data2 = Arc::new(BooleanArray::from(vec![
+            Some(false),
+            Some(true),
+            Some(true),
+            None,
+        ]));
+
+        let batch2 = RecordBatch::try_new(schema.clone(), vec![uids2, fake_data2]).unwrap();
+
+        // Hash both record batches
+        let mut digester = ArrowDigester::<Sha256>::new((*schema).clone());
+        digester.update(batch1);
+        digester.update(batch2);
+        assert_eq!(
+            hex::encode(digester.finalize()),
+            "9ba289655f0c7dd359ababc5a6f6188b352e45483623fbbf8b967723e2b798f8"
+        );
+    }
+}

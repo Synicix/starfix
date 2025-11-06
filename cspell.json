@@ -3,11 +3,10 @@
         "datatypes",
         "pyarrow",
         "pythonapi",
-        "uniffi"
+        "uniffi",
+        "uids"
     ],
-    "ignoreWords": [
-
-    ],
+    "ignoreWords": [],
     "useGitignore": false,
     "ignorePaths": [
         "Cargo.lock",
