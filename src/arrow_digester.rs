@@ -346,7 +346,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use sha2::Sha256;
 
-    use crate::hasher::ArrowDigester;
+    use crate::arrow_digester::ArrowDigester;
     use arrow::array::Decimal128Array;
 
     #[test]
