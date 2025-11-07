@@ -223,10 +223,12 @@ impl<D: Digest> ArrowDigester<D> {
             DataType::Struct(_) => todo!(),
             DataType::Union(_, _) => todo!(),
             DataType::Dictionary(_, _) => todo!(),
-            DataType::Decimal32(_, _) => todo!(),
-            DataType::Decimal64(_, _) => todo!(),
-            DataType::Decimal128(_, _) => todo!(),
-            DataType::Decimal256(_, _) => todo!(),
+            DataType::Decimal32(precision, scale)
+            | DataType::Decimal64(precision, scale)
+            | DataType::Decimal128(precision, scale)
+            | DataType::Decimal256(precision, scale) => {
+                Self::hash_decimal(precision, scale, array, digest)
+            }
             DataType::Map(_, _) => todo!(),
             DataType::RunEndEncoded(_, _) => todo!(),
         };
@@ -288,6 +290,21 @@ impl<D: Digest> ArrowDigester<D> {
         }
     }
 
+    fn hash_decimal(precision: &u8, scale: &i8, array: &dyn Array, digest: &mut D) {
+        // Include the precision and scale in the hash
+        digest.update([*precision]);
+        digest.update([*scale as u8]);
+
+        // Hash the underlying fixed size array based on precision
+        match precision {
+            1..=9 => Self::hash_fixed_size_array(array, digest, 4),
+            10..=18 => Self::hash_fixed_size_array(array, digest, 8),
+            19..=38 => Self::hash_fixed_size_array(array, digest, 16),
+            39..=76 => Self::hash_fixed_size_array(array, digest, 32),
+            _ => panic!("Unsupported decimal precision: {}", precision),
+        }
+    }
+
     /// Internal recursive function to extract field names from nested structs effectively flattening the schema
     /// The format is parent_child_grandchild_etc... for nested fields and will be stored in fields_digest_buffer
     fn extract_fields_name(
@@ -330,6 +347,7 @@ mod tests {
     use sha2::Sha256;
 
     use crate::hasher::ArrowDigester;
+    use arrow::array::Decimal128Array;
 
     #[test]
     fn boolean_array_hashing() {
@@ -370,6 +388,46 @@ mod tests {
             hash,
             "d30c8845c58f71bcec4910c65a91328af2cc86d26001662270da3a3d5222dd36"
         );
+    }
+
+    // Test all types of decimal hashing
+    #[test]
+    fn decimal_array_hashing() {
+        // Test Decimal32 (precision 1-9)
+        let decimal32_array =
+            Decimal128Array::from_iter(vec![Some(123), None, Some(-456), Some(0)])
+                .with_precision_and_scale(9, 2)
+                .unwrap();
+
+        assert_eq!(
+            hex::encode(ArrowDigester::<Sha256>::hash_array(&decimal32_array)),
+            "bd639e8df756f0bd194f18572e89ea180307e6d46e88d96ade52b61e196c3268"
+        );
+
+        // Test Decimal64 (precision 10-18)
+        let decimal64_array =
+            Decimal128Array::from_iter(vec![Some(1234567890123), None, Some(-9876543210), Some(0)])
+                .with_precision_and_scale(15, 3)
+                .unwrap();
+        assert_eq!(
+            hex::encode(ArrowDigester::<Sha256>::hash_array(&decimal64_array)),
+            "ca1f8a6fb179ddafad1e02738ad2d869da187c72a9b815d8e12a85692525d231"
+        );
+
+        // Test Decimal128 (precision 19-38)
+        let decimal128_array = Decimal128Array::from_iter(vec![
+            Some(123456789012345678901234567),
+            None,
+            Some(-987654321098765432109876543),
+            Some(0),
+        ])
+        .with_precision_and_scale(38, 5)
+        .unwrap();
+        assert_eq!(
+            hex::encode(ArrowDigester::<Sha256>::hash_array(&decimal128_array)),
+            "d2a1a2d8c87193032d46a541405e1bf60124d08a7c431ce3fe55f26508b400f3"
+        );
+        // Verify that different precisions/scales produce different hashe
     }
 
     #[test]
