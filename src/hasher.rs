@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
 use arrow::{
-    array::{Array, BooleanArray, RecordBatch, StructArray},
+    array::{
+        Array, BooleanArray, GenericListArray, LargeListArray, ListArray, OffsetSizeTrait,
+        RecordBatch, StructArray,
+    },
     datatypes::{DataType, Schema},
 };
 use arrow_schema::Field;
@@ -49,61 +52,24 @@ impl<D: Digest> ArrowDigester<D> {
         digester.finalize()
     }
 
-    /// Internal recursive function to extract field names from nested structs effectively flattening the schema
-    /// The format is parent_child_grandchild_etc... for nested fields and will be stored in fields_digest_buffer
-    fn extract_fields_name(
-        field: &Field,
-        parent_field_name: &str,
-        fields_digest_buffer: &mut BTreeMap<String, D>,
-    ) {
-        // Check if field is a nested type of struct
-        match field.data_type() {
-            DataType::Struct(fields) => {
-                // We will add fields in alphabetical order
-                fields.into_iter().for_each(|field| {
-                    Self::extract_fields_name(field, parent_field_name, fields_digest_buffer);
-                });
-            }
-            _ => {
-                // Base case, just add the field name
-                let field_name = if parent_field_name.is_empty() {
-                    field.name().to_string()
-                } else {
-                    format!("{}_{}", parent_field_name, field.name())
-                };
+    /// This will consume the ArrowDigester and produce the final combined digest where the schema
+    /// digest is fed in first, followed by each field digest in alphabetical order of field names
+    pub fn finalize(self) -> Vec<u8> {
+        // Finalize all the sub digest and combine them into a single digest
+        let mut final_digest = D::new();
 
-                fields_digest_buffer.insert(field_name, D::new());
-            }
-        }
-    }
+        // digest the schema first
+        final_digest.update(&self.schema_digest);
 
-    fn hash_fixed_size_array(array: &dyn Array, digest: &mut D, element_size: i32) {
-        let array_data = array.to_data();
+        // Then digest each field digest in order
+        self.fields_digest_buffer
+            .into_iter()
+            .for_each(|(_, digest)| {
+                let field_hash = digest.finalize();
+                final_digest.update(&field_hash);
+            });
 
-        // Get the slice with offset accounted for if there is any
-        let slice = array_data.buffers()[0]
-            .as_slice()
-            .get(array_data.offset() * element_size as usize..)
-            .expect("Failed to get buffer slice for FixedSizeBinaryArray");
-
-        // Deal with null
-        match array_data.nulls() {
-            Some(null_buffer) => {
-                // There are nulls, so we need to incrementally hash each value
-                for i in 0..array_data.len() {
-                    if null_buffer.is_valid(i) {
-                        let data_pos = i * element_size as usize;
-                        digest.update(&slice[data_pos..data_pos + element_size as usize]);
-                    } else {
-                        digest.update(NULL_BYTES);
-                    }
-                }
-            }
-            None => {
-                // No nulls, we can hash the entire buffer directly
-                digest.update(slice);
-            }
-        }
+        final_digest.finalize().to_vec()
     }
 
     /// Serialize the schema into a BTreeMap for field name and its digest
@@ -191,26 +157,6 @@ impl<D: Digest> ArrowDigester<D> {
         }
     }
 
-    /// This will consume the ArrowDigester and produce the final combined digest where the schema
-    /// digest is fed in first, followed by each field digest in alphabetical order of field names
-    pub fn finalize(self) -> Vec<u8> {
-        // Finalize all the sub digest and combine them into a single digest
-        let mut final_digest = D::new();
-
-        // digest the schema first
-        final_digest.update(&self.schema_digest);
-
-        // Then digest each field digest in order
-        self.fields_digest_buffer
-            .into_iter()
-            .for_each(|(_, digest)| {
-                let field_hash = digest.finalize();
-                final_digest.update(&field_hash);
-            });
-
-        final_digest.finalize().to_vec()
-    }
-
     fn array_digest_update(data_type: &DataType, array: &dyn Array, digest: &mut D) {
         match data_type {
             DataType::Null => todo!(),
@@ -251,10 +197,28 @@ impl<D: Digest> ArrowDigester<D> {
             DataType::Utf8 => todo!(),
             DataType::LargeUtf8 => todo!(),
             DataType::Utf8View => todo!(),
-            DataType::List(_) => todo!(),
+            DataType::List(field) => {
+                Self::hash_list_array(
+                    array
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .expect("Failed to downcast to ListArray"),
+                    field.data_type(),
+                    digest,
+                );
+            }
             DataType::ListView(_) => todo!(),
             DataType::FixedSizeList(_, _) => todo!(),
-            DataType::LargeList(_) => todo!(),
+            DataType::LargeList(field) => {
+                Self::hash_list_array(
+                    array
+                        .as_any()
+                        .downcast_ref::<LargeListArray>()
+                        .expect("Failed to downcast to LargeListArray"),
+                    field.data_type(),
+                    digest,
+                );
+            }
             DataType::LargeListView(_) => todo!(),
             DataType::Struct(_) => todo!(),
             DataType::Union(_, _) => todo!(),
@@ -267,13 +231,100 @@ impl<D: Digest> ArrowDigester<D> {
             DataType::RunEndEncoded(_, _) => todo!(),
         };
     }
+
+    fn hash_fixed_size_array(array: &dyn Array, digest: &mut D, element_size: i32) {
+        let array_data = array.to_data();
+
+        // Get the slice with offset accounted for if there is any
+        let slice = array_data.buffers()[0]
+            .as_slice()
+            .get(array_data.offset() * element_size as usize..)
+            .expect("Failed to get buffer slice for FixedSizeBinaryArray");
+
+        // Deal with null
+        match array_data.nulls() {
+            Some(null_buffer) => {
+                // There are nulls, so we need to incrementally hash each value
+                for i in 0..array_data.len() {
+                    if null_buffer.is_valid(i) {
+                        let data_pos = i * element_size as usize;
+                        digest.update(&slice[data_pos..data_pos + element_size as usize]);
+                    } else {
+                        digest.update(NULL_BYTES);
+                    }
+                }
+            }
+            None => {
+                // No nulls, we can hash the entire buffer directly
+                digest.update(slice);
+            }
+        }
+    }
+
+    fn hash_list_array(
+        array: &GenericListArray<impl OffsetSizeTrait>,
+        field_data_type: &DataType,
+        digest: &mut D,
+    ) {
+        match array.nulls() {
+            Some(null_buf) => {
+                for i in 0..array.len() {
+                    if null_buf.is_valid(i) {
+                        Self::array_digest_update(
+                            &field_data_type,
+                            array.value(i).as_ref(),
+                            digest,
+                        );
+                    } else {
+                        digest.update(NULL_BYTES);
+                    }
+                }
+            }
+            None => {
+                for i in 0..array.len() {
+                    Self::array_digest_update(&field_data_type, array.value(i).as_ref(), digest);
+                }
+            }
+        }
+    }
+
+    /// Internal recursive function to extract field names from nested structs effectively flattening the schema
+    /// The format is parent_child_grandchild_etc... for nested fields and will be stored in fields_digest_buffer
+    fn extract_fields_name(
+        field: &Field,
+        parent_field_name: &str,
+        fields_digest_buffer: &mut BTreeMap<String, D>,
+    ) {
+        // Check if field is a nested type of struct
+        match field.data_type() {
+            DataType::Struct(fields) => {
+                // We will add fields in alphabetical order
+                fields.into_iter().for_each(|field| {
+                    Self::extract_fields_name(field, parent_field_name, fields_digest_buffer);
+                });
+            }
+            _ => {
+                // Base case, just add the field name
+                let field_name = if parent_field_name.is_empty() {
+                    field.name().to_string()
+                } else {
+                    format!("{}_{}", parent_field_name, field.name())
+                };
+
+                fields_digest_buffer.insert(field_name, D::new());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, BooleanArray, Int32Array, RecordBatch};
+    use arrow::{
+        array::{ArrayRef, BooleanArray, Int32Array, RecordBatch},
+        datatypes::Int32Type,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use pretty_assertions::assert_eq;
     use sha2::Sha256;
@@ -300,6 +351,24 @@ mod tests {
         assert_eq!(
             hash,
             "bb36e54f5e2d937a05bb716a8d595f1c8da67fda48feeb7ab5b071a69e63d648"
+        );
+    }
+
+    // List array hashing test
+    #[test]
+    fn list_array_hashing() {
+        let list_array = arrow::array::ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1), Some(2), Some(3)]),
+            None,
+            Some(vec![Some(4), Some(5)]),
+            Some(vec![Some(6)]),
+        ]);
+
+        let hash = hex::encode(ArrowDigester::<Sha256>::hash_array(&list_array));
+        println!("{}", hash);
+        assert_eq!(
+            hash,
+            "d30c8845c58f71bcec4910c65a91328af2cc86d26001662270da3a3d5222dd36"
         );
     }
 
