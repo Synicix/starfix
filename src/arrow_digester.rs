@@ -272,11 +272,7 @@ impl<D: Digest> ArrowDigester<D> {
             Some(null_buf) => {
                 for i in 0..array.len() {
                     if null_buf.is_valid(i) {
-                        Self::array_digest_update(
-                            &field_data_type,
-                            array.value(i).as_ref(),
-                            digest,
-                        );
+                        Self::array_digest_update(field_data_type, array.value(i).as_ref(), digest);
                     } else {
                         digest.update(NULL_BYTES);
                     }
@@ -284,7 +280,7 @@ impl<D: Digest> ArrowDigester<D> {
             }
             None => {
                 for i in 0..array.len() {
-                    Self::array_digest_update(&field_data_type, array.value(i).as_ref(), digest);
+                    Self::array_digest_update(field_data_type, array.value(i).as_ref(), digest);
                 }
             }
         }
@@ -427,7 +423,6 @@ mod tests {
             hex::encode(ArrowDigester::<Sha256>::hash_array(&decimal128_array)),
             "d2a1a2d8c87193032d46a541405e1bf60124d08a7c431ce3fe55f26508b400f3"
         );
-        // Verify that different precisions/scales produce different hashe
     }
 
     #[test]
