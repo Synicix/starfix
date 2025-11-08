@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use arrow::{
     array::{
-        Array, BooleanArray, GenericListArray, LargeListArray, ListArray, OffsetSizeTrait,
-        RecordBatch, StructArray,
+        Array, BinaryArray, BooleanArray, GenericBinaryArray, GenericListArray, GenericStringArray,
+        LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, OffsetSizeTrait,
+        RecordBatch, StringArray, StructArray,
     },
     datatypes::{DataType, Schema},
 };
@@ -172,30 +173,56 @@ impl<D: Digest> ArrowDigester<D> {
                     None => digest.update(NULL_BYTES),
                 });
             }
-            DataType::Int8 => Self::hash_fixed_size_array(array, digest, 1),
-            DataType::Int16 => Self::hash_fixed_size_array(array, digest, 2),
-            DataType::Int32 => Self::hash_fixed_size_array(array, digest, 4),
-            DataType::Int64 => Self::hash_fixed_size_array(array, digest, 8),
-            DataType::UInt8 => Self::hash_fixed_size_array(array, digest, 1),
-            DataType::UInt16 => Self::hash_fixed_size_array(array, digest, 2),
-            DataType::UInt32 => Self::hash_fixed_size_array(array, digest, 4),
-            DataType::UInt64 => Self::hash_fixed_size_array(array, digest, 8),
-            DataType::Float16 => Self::hash_fixed_size_array(array, digest, 2),
-            DataType::Float32 => Self::hash_fixed_size_array(array, digest, 4),
-            DataType::Float64 => Self::hash_fixed_size_array(array, digest, 8),
+            DataType::Int8 => Self::hash_fixed_size_array(array, digest, &1),
+            DataType::Int16 => Self::hash_fixed_size_array(array, digest, &2),
+            DataType::Int32 => Self::hash_fixed_size_array(array, digest, &4),
+            DataType::Int64 => Self::hash_fixed_size_array(array, digest, &8),
+            DataType::UInt8 => Self::hash_fixed_size_array(array, digest, &1),
+            DataType::UInt16 => Self::hash_fixed_size_array(array, digest, &2),
+            DataType::UInt32 => Self::hash_fixed_size_array(array, digest, &4),
+            DataType::UInt64 => Self::hash_fixed_size_array(array, digest, &8),
+            DataType::Float16 => Self::hash_fixed_size_array(array, digest, &2),
+            DataType::Float32 => Self::hash_fixed_size_array(array, digest, &4),
+            DataType::Float64 => Self::hash_fixed_size_array(array, digest, &8),
             DataType::Timestamp(_, _) => todo!(),
-            DataType::Date32 => Self::hash_fixed_size_array(array, digest, 4),
-            DataType::Date64 => Self::hash_fixed_size_array(array, digest, 8),
+            DataType::Date32 => Self::hash_fixed_size_array(array, digest, &4),
+            DataType::Date64 => Self::hash_fixed_size_array(array, digest, &8),
             DataType::Time32(_) => todo!(),
             DataType::Time64(_) => todo!(),
             DataType::Duration(_) => todo!(),
             DataType::Interval(_) => todo!(),
-            DataType::Binary => todo!(),
-            DataType::FixedSizeBinary(_) => todo!(),
-            DataType::LargeBinary => todo!(),
+            DataType::Binary => Self::hash_binary_array(
+                array
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .expect("Failed to downcast to BinaryArray"),
+                digest,
+            ),
+            DataType::FixedSizeBinary(element_size) => {
+                Self::hash_fixed_size_array(array, digest, element_size)
+            }
+            DataType::LargeBinary => Self::hash_binary_array(
+                array
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .expect("Failed to downcast to LargeBinaryArray"),
+                digest,
+            ),
             DataType::BinaryView => todo!(),
-            DataType::Utf8 => todo!(),
-            DataType::LargeUtf8 => todo!(),
+            DataType::Utf8 => Self::hash_string_array(
+                array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Failed to downcast to StringArray"),
+                digest,
+            ),
+            DataType::LargeUtf8 => Self::hash_string_array(
+                array
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("Failed to downcast to LargeStringArray"),
+                digest,
+            ),
             DataType::Utf8View => todo!(),
             DataType::List(field) => {
                 Self::hash_list_array(
@@ -234,13 +261,14 @@ impl<D: Digest> ArrowDigester<D> {
         };
     }
 
-    fn hash_fixed_size_array(array: &dyn Array, digest: &mut D, element_size: i32) {
+    fn hash_fixed_size_array(array: &dyn Array, digest: &mut D, element_size: &i32) {
         let array_data = array.to_data();
+        let element_size_usize = *element_size as usize;
 
         // Get the slice with offset accounted for if there is any
         let slice = array_data.buffers()[0]
             .as_slice()
-            .get(array_data.offset() * element_size as usize..)
+            .get(array_data.offset() * element_size_usize..)
             .expect("Failed to get buffer slice for FixedSizeBinaryArray");
 
         // Deal with null
@@ -249,8 +277,8 @@ impl<D: Digest> ArrowDigester<D> {
                 // There are nulls, so we need to incrementally hash each value
                 for i in 0..array_data.len() {
                     if null_buffer.is_valid(i) {
-                        let data_pos = i * element_size as usize;
-                        digest.update(&slice[data_pos..data_pos + element_size as usize]);
+                        let data_pos = i * element_size_usize;
+                        digest.update(&slice[data_pos..data_pos + element_size_usize]);
                     } else {
                         digest.update(NULL_BYTES);
                     }
@@ -259,6 +287,48 @@ impl<D: Digest> ArrowDigester<D> {
             None => {
                 // No nulls, we can hash the entire buffer directly
                 digest.update(slice);
+            }
+        }
+    }
+
+    fn hash_binary_array(array: &GenericBinaryArray<impl OffsetSizeTrait>, digest: &mut D) {
+        match array.nulls() {
+            Some(null_buf) => {
+                for i in 0..array.len() {
+                    if null_buf.is_valid(i) {
+                        let value = array.value(i);
+                        digest.update(value);
+                    } else {
+                        digest.update(NULL_BYTES);
+                    }
+                }
+            }
+            None => {
+                for i in 0..array.len() {
+                    let value = array.value(i);
+                    digest.update(value);
+                }
+            }
+        }
+    }
+
+    fn hash_string_array(array: &GenericStringArray<impl OffsetSizeTrait>, digest: &mut D) {
+        match array.nulls() {
+            Some(null_buf) => {
+                for i in 0..array.len() {
+                    if null_buf.is_valid(i) {
+                        let value = array.value(i);
+                        digest.update(value.as_bytes());
+                    } else {
+                        digest.update(NULL_BYTES);
+                    }
+                }
+            }
+            None => {
+                for i in 0..array.len() {
+                    let value = array.value(i);
+                    digest.update(value.as_bytes());
+                }
             }
         }
     }
@@ -293,10 +363,10 @@ impl<D: Digest> ArrowDigester<D> {
 
         // Hash the underlying fixed size array based on precision
         match precision {
-            1..=9 => Self::hash_fixed_size_array(array, digest, 4),
-            10..=18 => Self::hash_fixed_size_array(array, digest, 8),
-            19..=38 => Self::hash_fixed_size_array(array, digest, 16),
-            39..=76 => Self::hash_fixed_size_array(array, digest, 32),
+            1..=9 => Self::hash_fixed_size_array(array, digest, &4),
+            10..=18 => Self::hash_fixed_size_array(array, digest, &8),
+            19..=38 => Self::hash_fixed_size_array(array, digest, &16),
+            39..=76 => Self::hash_fixed_size_array(array, digest, &32),
             _ => panic!("Unsupported decimal precision: {}", precision),
         }
     }
@@ -365,6 +435,60 @@ mod tests {
         assert_eq!(
             hash,
             "bb36e54f5e2d937a05bb716a8d595f1c8da67fda48feeb7ab5b071a69e63d648"
+        );
+    }
+
+    /// Test binary array hashing
+    #[test]
+    fn binary_array_hashing() {
+        let binary_array = arrow::array::BinaryArray::from(vec![
+            Some(b"hello".as_ref()),
+            None,
+            Some(b"world".as_ref()),
+            Some(b"".as_ref()),
+        ]);
+        let hash = hex::encode(ArrowDigester::<Sha256>::hash_array(&binary_array));
+        assert_eq!(
+            hash,
+            "078347d3063fb5bbe0bdbd3315cf8e5e140733ea34e6b73cbc0838b60a9c8012"
+        );
+
+        // Test large binary array with same data to ensure consistency
+        let large_binary_array = arrow::array::LargeBinaryArray::from(vec![
+            Some(b"hello".as_ref()),
+            None,
+            Some(b"world".as_ref()),
+            Some(b"".as_ref()),
+        ]);
+
+        assert_eq!(
+            hex::encode(ArrowDigester::<Sha256>::hash_array(&large_binary_array)),
+            hash
+        );
+    }
+
+    // Test String hashing
+    #[test]
+    fn string_array_hashing() {
+        let string_array =
+            arrow::array::StringArray::from(vec![Some("hello"), None, Some("world"), Some("")]);
+        let hash = hex::encode(ArrowDigester::<Sha256>::hash_array(&string_array));
+        assert_eq!(
+            hash,
+            "078347d3063fb5bbe0bdbd3315cf8e5e140733ea34e6b73cbc0838b60a9c8012"
+        );
+
+        // Test large string array with same data to ensure consistency
+        let large_string_array = arrow::array::LargeStringArray::from(vec![
+            Some("hello"),
+            None,
+            Some("world"),
+            Some(""),
+        ]);
+
+        assert_eq!(
+            hex::encode(ArrowDigester::<Sha256>::hash_array(&large_string_array)),
+            hash
         );
     }
 
