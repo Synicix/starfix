@@ -8,7 +8,7 @@ use arrow::{
     },
     datatypes::{DataType, Schema},
 };
-use arrow_schema::Field;
+use arrow_schema::{Field, TimeUnit};
 use digest::Digest;
 use postcard::to_vec;
 
@@ -187,8 +187,8 @@ impl<D: Digest> ArrowDigester<D> {
             DataType::Timestamp(_, _) => todo!(),
             DataType::Date32 => Self::hash_fixed_size_array(array, digest, &4),
             DataType::Date64 => Self::hash_fixed_size_array(array, digest, &8),
-            DataType::Time32(_) => todo!(),
-            DataType::Time64(_) => todo!(),
+            DataType::Time32(time_unit) => Self::hash_time_array(array, time_unit, digest, &4),
+            DataType::Time64(time_unit) => Self::hash_time_array(array, time_unit, digest, &8),
             DataType::Duration(_) => todo!(),
             DataType::Interval(_) => todo!(),
             DataType::Binary => Self::hash_binary_array(
@@ -310,6 +310,24 @@ impl<D: Digest> ArrowDigester<D> {
                 }
             }
         }
+    }
+
+    fn hash_time_array(
+        array: &dyn Array,
+        time_unit: &TimeUnit,
+        digest: &mut D,
+        element_size: &i32,
+    ) {
+        // We need to update the digest with the time unit first to ensure different time units produce different hashes
+        digest.update([match time_unit {
+            TimeUnit::Second => 0u8,
+            TimeUnit::Millisecond => 1u8,
+            TimeUnit::Microsecond => 2u8,
+            TimeUnit::Nanosecond => 3u8,
+        }]);
+
+        // Now hash the underlying fixed size array based on time unit
+        Self::hash_fixed_size_array(array, digest, element_size);
     }
 
     fn hash_string_array(array: &GenericStringArray<impl OffsetSizeTrait>, digest: &mut D) {
@@ -436,6 +454,47 @@ mod tests {
             hash,
             "bb36e54f5e2d937a05bb716a8d595f1c8da67fda48feeb7ab5b071a69e63d648"
         );
+    }
+
+    /// Test time array hashing
+    #[test]
+    fn time32_array_hashing() {
+        let time_array =
+            arrow::array::Time32SecondArray::from(vec![Some(1000), None, Some(5000), Some(0)]);
+        let hash = hex::encode(ArrowDigester::<Sha256>::hash_array(&time_array));
+        println!("{}", hash);
+        assert_eq!(
+            hash,
+            "b5d70eca0650399a9b00440e3cd9985e58b0f033d446bdd5947f96a62397002a"
+        );
+    }
+
+    #[test]
+    fn time64_array_hashing() {
+        let time_array = arrow::array::Time64MicrosecondArray::from(vec![
+            Some(1000000),
+            None,
+            Some(5000000),
+            Some(0),
+        ]);
+        let hash = hex::encode(ArrowDigester::<Sha256>::hash_array(&time_array));
+        println!("{}", hash);
+        assert_eq!(
+            hash,
+            "1f0847660ea421c266f226293d2f0c54ea5de0c168ac7e4bebfabf6d348a6d18"
+        );
+    }
+
+    #[test]
+    fn time_array_different_units_produce_different_hashes() {
+        let time32_second = arrow::array::Time32SecondArray::from(vec![Some(1000), Some(2000)]);
+        let time32_millis =
+            arrow::array::Time32MillisecondArray::from(vec![Some(1000), Some(2000)]);
+
+        let hash_second = hex::encode(ArrowDigester::<Sha256>::hash_array(&time32_second));
+        let hash_millis = hex::encode(ArrowDigester::<Sha256>::hash_array(&time32_millis));
+
+        assert_ne!(hash_second, hash_millis);
     }
 
     /// Test binary array hashing
