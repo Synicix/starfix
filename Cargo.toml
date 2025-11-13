@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 arrow = { version = "57.0.0", features = ["ffi"] }
-arrow-digest = "56.0.0"
 arrow-schema = { version = "57.0.0", features = ["serde"] }
 digest = "0.10.7"
 hex = "0.4.3"

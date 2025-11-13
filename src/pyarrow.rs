@@ -1,5 +1,8 @@
 use arrow::array::{RecordBatch, StructArray};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
+use sha2::Sha256;
+
+use crate::arrow_digester::ArrowDigester;
 
 /// Process an Arrow table via C Data Interface
 ///
@@ -14,9 +17,6 @@ pub fn process_arrow_table(array_ptr: u64, schema_ptr: u64) -> Vec<u8> {
         from_ffi(ffi_array, &ffi_schema).expect("Failed to import Arrow array data")
     };
 
-    // Create RecordBatch from StructArray
-    let _record_batch = RecordBatch::from(StructArray::from(array_data));
-
     // Hash the table
-    Vec::new()
+    ArrowDigester::<Sha256>::hash_record_batch(&RecordBatch::from(StructArray::from(array_data)))
 }
