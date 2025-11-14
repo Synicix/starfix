@@ -13,8 +13,6 @@ jobs:
         with:
           toolchain: 1.90.0
           components: rustfmt,clippy
-      - name: Install code coverage
-        uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run syntax and style tests
         run: cargo clippy --all-targets -- -D warnings
       - name: Run format test
