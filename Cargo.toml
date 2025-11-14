@@ -8,7 +8,6 @@ readme = "README.md"
 repository = "https://github.com/nauticalab/starfix"
 license = "MIT OR Apache-2.0"
 keywords = ["arrow", "hashing"]
-categories = ["hashing", "arrow"]
 
 [dependencies]
 arrow = { version = "57.0.0", features = ["ffi"] }
